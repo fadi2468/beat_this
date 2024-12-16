@@ -18,12 +18,11 @@ def main(args):
     print(args)
 
     params_str = f"{'noval ' if not args.val else ''}{'hung ' if args.hung_data else ''}{'fold' + str(args.fold) + ' ' if args.fold is not None else ''}{args.loss}-h{args.transformer_dim}-aug{args.tempo_augmentation}{args.pitch_augmentation}{args.mask_augmentation}{' nosumH ' if not args.sum_head else ''}{' nopartialT ' if not args.partial_transformers else ''}"
+    logger = None
     if args.logger == "wandb":
         logger = WandbLogger(
             project="beat_this", name=f"{args.name} {params_str}".strip()
         )
-    else:
-        logger = None
 
     if args.force_flash_attention:
         print("Forcing the use of the flash attention.")
@@ -31,9 +30,9 @@ def main(args):
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(False)
 
-    data_dir = Path(__file__).parent.parent.relative_to(Path.cwd()) / "data"
+    data_dir = Path(__file__).resolve().parent.parent / "data"
     checkpoint_dir = (
-        Path(__file__).parent.parent.relative_to(Path.cwd()) / "checkpoints"
+              Path(__file__).resolve().parent.parent / "checkpoints"
     )
     augmentations = {}
     if args.tempo_augmentation:
@@ -74,7 +73,10 @@ def main(args):
         "frontend": args.frontend_dropout,
         "transformer": args.transformer_dropout,
     }
+
+    # Dynamically initialize the PLBeatThis model
     pl_model = PLBeatThis(
+        model_type=args.model_type,  # Dynamically select model type
         spect_dim=128,
         fps=50,
         transformer_dim=args.transformer_dim,
@@ -93,13 +95,19 @@ def main(args):
         eval_trim_beats=args.eval_trim_beats,
         sum_head=args.sum_head,
         partial_transformers=args.partial_transformers,
+        num_filters=args.num_filters,  # Parameters specific to BeatThisSmall
+        kernel_size=args.kernel_size,
+        num_dilations=args.num_dilations,
+        dropout_rate=args.dropout_rate,
     )
+
     for part in args.compile:
-        if hasattr(pl_model.model, part):
-            setattr(pl_model.model, part, torch.compile(getattr(pl_model.model, part)))
-            print("Will compile model", part)
-        else:
-            raise ValueError("The model is missing the part", part, "to compile")
+        if part:  # Skip if `part` is an empty string
+            if hasattr(pl_model.model, part):
+                setattr(pl_model.model, part, torch.compile(getattr(pl_model.model, part)))
+                print("Will compile model", part)
+            else:
+                raise ValueError("The model is missing the part", part, "to compile")
 
     callbacks = [LearningRateMonitor(logging_interval="step")]
     # save only the last model
@@ -133,145 +141,48 @@ if __name__ == "__main__":
     parser.add_argument("--name", type=str, default="")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument(
-        "--force-flash-attention", default=False, action=argparse.BooleanOptionalAction
+        "--model-type", type=str, choices=["BeatThis", "BeatThisSmall"], default="BeatThisSmall"
     )
+    parser.add_argument("--force-flash-attention", default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument(
         "--compile",
         action="store",
         nargs="*",
         type=str,
         default=["frontend", "transformer_blocks", "task_heads"],
-        help="Which model parts to compile, among frontend, transformer_encoder, task_heads",
     )
     parser.add_argument("--n-layers", type=int, default=6)
     parser.add_argument("--transformer-dim", type=int, default=512)
-    parser.add_argument(
-        "--frontend-dropout",
-        type=float,
-        default=0.1,
-        help="dropout rate to apply in the frontend",
-    )
-    parser.add_argument(
-        "--transformer-dropout",
-        type=float,
-        default=0.2,
-        help="dropout rate to apply in the main transformer blocks",
-    )
+    parser.add_argument("--frontend-dropout", type=float, default=0.1)
+    parser.add_argument("--transformer-dropout", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=0.0008)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--logger", type=str, choices=["wandb", "none"], default="none")
     parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--n-heads", type=int, default=16)
-    parser.add_argument("--fps", type=int, default=50, help="The spectrograms fps.")
-    parser.add_argument(
-        "--loss",
-        type=str,
-        default="shift_tolerant_weighted_bce",
-        choices=[
-            "shift_tolerant_weighted_bce",
-            "fast_shift_tolerant_weighted_bce",
-            "weighted_bce",
-            "bce",
-        ],
-        help="The loss to use",
-    )
-    parser.add_argument(
-        "--warmup-steps", type=int, default=1000, help="warmup steps for optimizer"
-    )
-    parser.add_argument(
-        "--max-epochs", type=int, default=100, help="max epochs for training"
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=8, help="batch size for training"
-    )
+    parser.add_argument("--fps", type=int, default=50)
+    parser.add_argument("--loss", type=str, default="shift_tolerant_weighted_bce")
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--max-epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--accumulate-grad-batches", type=int, default=8)
-    parser.add_argument(
-        "--train-length",
-        type=int,
-        default=1500,
-        help="maximum seq length for training in frames",
-    )
-    parser.add_argument(
-        "--dbn",
-        default=False,
-        action=argparse.BooleanOptionalAction,
-        help="use madmom postprocessing DBN",
-    )
-    parser.add_argument(
-        "--eval-trim-beats",
-        metavar="SECONDS",
-        type=float,
-        default=5,
-        help="Skip the first given seconds per piece in evaluating (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--val-frequency",
-        metavar="N",
-        type=int,
-        default=5,
-        help="validate every N epochs (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--tempo-augmentation",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Use precomputed tempo aumentation",
-    )
-    parser.add_argument(
-        "--pitch-augmentation",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Use precomputed pitch aumentation",
-    )
-    parser.add_argument(
-        "--mask-augmentation",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Use online mask aumentation",
-    )
-    parser.add_argument(
-        "--sum-head",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Use SumHead instead of two separate Linear heads",
-    )
-    parser.add_argument(
-        "--partial-transformers",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Use Partial transformers in the frontend",
-    )
-    parser.add_argument(
-        "--length-based-oversampling-factor",
-        type=float,
-        default=0.65,
-        help="The factor to oversample the long pieces in the dataset. Set to 0 to only take one excerpt for each piece.",
-    )
-    parser.add_argument(
-        "--val",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Train on all data, including validation data, escluding test data. The validation metrics will still be computed, but they won't carry any meaning.",
-    )
-    parser.add_argument(
-        "--hung-data",
-        default=False,
-        action=argparse.BooleanOptionalAction,
-        help="Limit the training to Hung et al. data. The validation will still be computed on all datasets.",
-    )
-    parser.add_argument(
-        "--fold",
-        type=int,
-        default=None,
-        help="If given, the CV fold number to *not* train on (0-based).",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Seed for the random number generators.",
-    )
+    parser.add_argument("--train-length", type=int, default=1500)
+    parser.add_argument("--dbn", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--eval-trim-beats", type=float, default=5)
+    parser.add_argument("--val-frequency", type=int, default=5)
+    parser.add_argument("--tempo-augmentation", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--pitch-augmentation", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--mask-augmentation", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--sum-head", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--partial-transformers", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--length-based-oversampling-factor", type=float, default=0.65)
+    parser.add_argument("--val", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--hung-data", default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--fold", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num-filters", type=int, default=100)
+    parser.add_argument("--kernel-size", type=int, default=5)
+    parser.add_argument("--num-dilations", type=int, default=10)
+    parser.add_argument("--dropout-rate", type=float, default=0.15)
 
     args = parser.parse_args()
-
     main(args)

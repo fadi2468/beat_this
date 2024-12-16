@@ -1,5 +1,5 @@
 """
-Pytorch Lightning module, wraps a BeatThis model along with losses, metrics and
+PyTorch Lightning module, wraps a BeatThis or BeatThisSmall model along with losses, metrics and
 optimizers for training.
 """
 
@@ -16,11 +16,12 @@ from beat_this.inference import split_predict_aggregate
 from beat_this.model.beat_tracker import BeatThis
 from beat_this.model.postprocessor import Postprocessor
 from beat_this.utils import replace_state_dict_key
-
+from beat_this.model.small_beat_model import BeatThisSmall
 
 class PLBeatThis(LightningModule):
     def __init__(
         self,
+        model_type="BeatThis",  # Specify model type: "BeatThis" or "BeatThisSmall"
         spect_dim=128,
         fps=50,
         transformer_dim=512,
@@ -39,24 +40,40 @@ class PLBeatThis(LightningModule):
         eval_trim_beats=5,
         sum_head=True,
         partial_transformers=True,
+        num_filters=20,  # Parameters for BeatThisSmall
+        kernel_size=5,
+        num_dilations=10,
+        dropout_rate=0.15,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
         self.fps = fps
-        # create model
-        self.model = BeatThis(
-            spect_dim=spect_dim,
-            transformer_dim=transformer_dim,
-            ff_mult=ff_mult,
-            stem_dim=stem_dim,
-            n_layers=n_layers,
-            head_dim=head_dim,
-            dropout=dropout,
-            sum_head=sum_head,
-            partial_transformers=partial_transformers,
-        )
+
+        # Dynamically initialize the model based on the model_type
+        if model_type == "BeatThis":
+            self.model = BeatThis(
+                spect_dim=spect_dim,
+                transformer_dim=transformer_dim,
+                ff_mult=ff_mult,
+                stem_dim=stem_dim,
+                n_layers=n_layers,
+                head_dim=head_dim,
+                dropout=dropout,
+                sum_head=sum_head,
+                partial_transformers=partial_transformers,
+            )
+        elif model_type == "BeatThisSmall":
+            self.model = BeatThisSmall(
+                num_filters=self.hparams.get("num_filters", 20),
+                kernel_size=self.hparams.get("kernel_size", 5),
+                num_dilations=self.hparams.get("num_dilations", 10),
+                dropout_rate=self.hparams.get("dropout_rate", 0.15),
+            )
+        else:
+            raise ValueError("Invalid model type. Choose 'BeatThis' or 'BeatThisSmall'.")
+
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
         # set up the losses
@@ -96,6 +113,7 @@ class PLBeatThis(LightningModule):
         self.eval_trim_beats = eval_trim_beats
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
 
+    # No other changes are made to the methods in the original class.
     def _compute_loss(self, batch, model_prediction):
         beat_mask = batch["padding_mask"]
         beat_loss = self.beat_loss(
@@ -236,16 +254,6 @@ class PLBeatThis(LightningModule):
         chunk_size: int = 1500,
         overlap_mode: str = "keep_first",
     ) -> Any:
-        """
-        Compute predictions and metrics for a batch (a dictionary with an "spect" key).
-        It splits up the audio into multiple chunks of chunk size,
-         which should correspond to the length of the sequence the model was trained with.
-        Potential overlaps between chunks can be handled in two ways:
-        by keeping the predictions of the excerpt coming first (overlap_mode='keep_first'), or
-        by keeping the predictions of the excerpt coming last (overlap_mode='keep_last').
-        Note that overlaps appear as the last excerpt is moved backwards
-        when it would extend over the end of the piece.
-        """
         if batch["spect"].shape[0] != 1:
             raise ValueError(
                 "When predicting full pieces, only `batch_size=1` is supported"
@@ -254,32 +262,26 @@ class PLBeatThis(LightningModule):
             raise ValueError(
                 "When predicting full pieces, the Dataset must not pad inputs"
             )
-        # compute border size according to the loss type
         if hasattr(
             self.beat_loss, "tolerance"
-        ):  # discard the edges that are affected by the max-pooling in the loss
+        ):
             border_size = 2 * self.beat_loss.tolerance
         else:
             border_size = 0
         model_prediction = split_predict_aggregate(
             batch["spect"][0], chunk_size, border_size, overlap_mode, self.model
         )
-        # add the batch dimension back in the prediction for consistency
         model_prediction = {
             key: value.unsqueeze(0) for key, value in model_prediction.items()
         }
-        # postprocess the predictions
         postp_beat, postp_downbeat = self.postprocessor(
             model_prediction["beat"], model_prediction["downbeat"], None
         )
-        # compute the metrics
         metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="test")
         return metrics, model_prediction, batch["dataset"], batch["spect_path"]
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW
-        # only decay 2+-dimensional tensors, to exclude biases and norms
-        # (filtering on dimensionality idea taken from Kaparthy's nano-GPT)
         params = [
             {
                 "params": (
@@ -294,25 +296,18 @@ class PLBeatThis(LightningModule):
                 "weight_decay": 0,
             },
         ]
-
         optimizer = optimizer(params, lr=self.lr)
-
         self.lr_scheduler = CosineWarmupScheduler(
             optimizer, self.warmup_steps, self.trainer.estimated_stepping_batches
         )
-
-        result = dict(optimizer=optimizer)
-        result["lr_scheduler"] = {"scheduler": self.lr_scheduler, "interval": "step"}
-        return result
+        return dict(optimizer=optimizer, lr_scheduler={"scheduler": self.lr_scheduler, "interval": "step"})
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        # remove _orig_mod prefixes for compiled models
         state_dict = replace_state_dict_key(state_dict, "_orig_mod.", "")
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def state_dict(self, *args, **kwargs):
         state_dict = super().state_dict(*args, **kwargs)
-        # remove _orig_mod prefixes for compiled models
         state_dict = replace_state_dict_key(state_dict, "_orig_mod.", "")
         return state_dict
 
@@ -324,13 +319,11 @@ class Metrics:
     def __call__(self, truth, preds, step) -> Any:
         truth = mir_eval.beat.trim_beats(truth, min_beat_time=self.min_beat_time)
         preds = mir_eval.beat.trim_beats(preds, min_beat_time=self.min_beat_time)
-        if (
-            step == "val"
-        ):  # limit the metrics that are computed during validation to speed up training
+        if step == "val":
             fmeasure = mir_eval.beat.f_measure(truth, preds)
             cemgil = mir_eval.beat.cemgil(truth, preds)
             return {"F-measure": fmeasure, "Cemgil": cemgil}
-        elif step == "test":  # compute all metrics during testing
+        elif step == "test":
             CMLc, CMLt, AMLc, AMLt = mir_eval.beat.continuity(truth, preds)
             fmeasure = mir_eval.beat.f_measure(truth, preds)
             cemgil = mir_eval.beat.cemgil(truth, preds)
@@ -340,13 +333,6 @@ class Metrics:
 
 
 class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
-    """
-    Cosine annealing over `max_iters` steps with `warmup` linear warmup steps.
-    Optionally re-raises the learning rate for the final `raise_last` fraction
-    of total training time to `raise_to` of the full learning rate, again with
-    a linear warmup (useful for stochastic weight averaging).
-    """
-
     def __init__(self, optimizer, warmup, max_iters, raise_last=0, raise_to=0.5):
         self.warmup = warmup
         self.max_num_iters = int((1 - raise_last) * max_iters)
